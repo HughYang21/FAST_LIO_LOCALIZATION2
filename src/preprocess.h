@@ -114,7 +114,8 @@ typedef struct {
   float reflectivity; /**< Reflectivity   */
   uint8_t tag;        /**< Livox point tag   */
   uint8_t line;       /**< Laser line id     */
-} LivoxPointXyzrtl;
+  double timestamp;   /**< Timestamp of the point, Unit: second */
+} LivoxPointXyzrtlt;
 
 typedef struct {
   float x;            /**< X axis, Unit:m */
@@ -123,24 +124,27 @@ typedef struct {
   float intensity;    /**< Intensity   */
   uint8_t tag;        /**< Livox point tag   */
   uint8_t line;       /**< Laser line id     */
-} LivoxPointXyzitl;
+  double timestamp;   /**< Timestamp of the point, Unit: second */
+} LivoxPointXyzitlt;
 }
-POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzrtl,
+POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzrtlt,
     (float, x, x)
     (float, y, y)
     (float, z, z)
     (float, reflectivity, reflectivity)
     (uint8_t, tag, tag)
     (uint8_t, line, line)
+    (double, timestamp, timestamp)
 )
 
-POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzitl,
+POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzitlt,
     (float, x, x)
     (float, y, y)
     (float, z, z)
     (float, intensity, intensity)
     (uint8_t, tag, tag)
     (uint8_t, line, line)
+    (double, timestamp, timestamp)
 )
 
 class Preprocess

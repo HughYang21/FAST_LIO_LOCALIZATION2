@@ -67,7 +67,7 @@ class TransformFusion(Node):
         # print(self.cur_odom_to_baselink.header)
         transform_stamped_msg = tf2_ros.TransformStamped(
                 header = self.cur_odom_to_baselink.header,
-                child_frame_id = "camera_init",
+                child_frame_id = "odom",
                 transform = transform_msg
             )
         transform_stamped_msg.header.frame_id = "map"
@@ -90,7 +90,7 @@ class TransformFusion(Node):
 
             localization.header.stamp = self.get_clock().now().to_msg()
             localization.header.frame_id = "map"
-            localization.child_frame_id = "body"
+            localization.child_frame_id = "base_link"
             self.pub_localization.publish(localization)
 
 
@@ -104,8 +104,13 @@ class TransformFusion(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = TransformFusion()
-    rclpy.spin(node)
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
 
 
 if __name__ == "__main__":

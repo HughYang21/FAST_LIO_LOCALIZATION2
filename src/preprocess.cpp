@@ -462,7 +462,7 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
   pl_corn.clear();
   pl_full.clear();
 
-  pcl::PointCloud<livox_ros::LivoxPointXyzitl> pl_orig;
+  pcl::PointCloud<livox_ros::LivoxPointXyzitlt> pl_orig;
   pcl::fromROSMsg(*msg, pl_orig);
   int plsize = pl_orig.points.size();
   if (plsize == 0)
@@ -477,16 +477,30 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
   std::vector<float> time_last(N_SCANS, 0.0); // last offset time
   /*****************************************************************/
 
-  given_offset_time = false;
-  double yaw_first = atan2(pl_orig.points[0].y, pl_orig.points[0].x) * 57.29578;
-  double yaw_end = yaw_first;
-  int layer_first = pl_orig.points[0].line;
-  for (uint i = plsize - 1; i > 0; i--)
+  // Extract the frame start time from the ROS 2 message header header (converted to nanoseconds)
+  uint64_t msg_base_time_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
+
+  // --- TIMESTAMP CHECK CONDITION ---
+  // Check if the incoming point cloud contains active point-wise hardware timestamps.
+  // Note: Depending on your custom PCL point struct token bindings, change '.timestamp' 
+  // to matching field labels (like '.time' or '.timestamp') if compilation throws an error.
+  if (plsize > 0 && pl_orig.points[plsize - 1].timestamp > 0)
   {
-    if (pl_orig.points[i].line == layer_first)
+    given_offset_time = true;
+  }
+  else
+  {
+    given_offset_time = false;
+    double yaw_first = atan2(pl_orig.points[0].y, pl_orig.points[0].x) * 57.29578;
+    double yaw_end = yaw_first;
+    int layer_first = pl_orig.points[0].line;
+    for (uint i = plsize - 1; i > 0; i--)
     {
-      yaw_end = atan2(pl_orig.points[i].y, pl_orig.points[i].x) * 57.29578;
-      break;
+      if (pl_orig.points[i].line == layer_first)
+      {
+        yaw_end = atan2(pl_orig.points[i].y, pl_orig.points[i].x) * 57.29578;
+        break;
+      }
     }
   }
 
@@ -500,37 +514,54 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     added_pt.y = pl_orig.points[i].y;
     added_pt.z = pl_orig.points[i].z;
     added_pt.intensity = pl_orig.points[i].intensity;
-    added_pt.curvature = 0.;
+    added_pt.curvature = 0.0;
 
     int layer = pl_orig.points[i].line;
-    double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
 
-    if (is_first[layer])
+    if (given_offset_time)
     {
-      // printf("layer: %d; is first: %d", layer, is_first[layer]);
-      yaw_fp[layer] = yaw_angle;
-      is_first[layer] = false;
-      added_pt.curvature = 0.0;
-      yaw_last[layer] = yaw_angle;
-      time_last[layer] = added_pt.curvature;
-      continue;
-    }
-
-    // compute offset time
-    if (yaw_angle <= yaw_fp[layer])
-    {
-      added_pt.curvature = (yaw_fp[layer] - yaw_angle) / omega_l;
+      // Your driver packs absolute hardware epoch nanoseconds into the 'timestamp' double field.
+      // FAST-LIO needs the relative point offset time from the scan start in MILLISECONDS.
+      double point_abs_time_ns = pl_orig.points[i].timestamp;
+      
+      // Calculate relative nanosecond offset and scale to milliseconds
+      added_pt.curvature = (point_abs_time_ns - static_cast<double>(msg_base_time_ns)) / 1000000.0;
     }
     else
     {
-      added_pt.curvature = (yaw_fp[layer] - yaw_angle + 360.0) / omega_l;
+      // Fallback geometric math estimation if hardware timestamps are missing
+      double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
+
+      if (is_first[layer])
+      {
+        yaw_fp[layer] = yaw_angle;
+        is_first[layer] = false;
+        added_pt.curvature = 0.0;
+        yaw_last[layer] = yaw_angle;
+        time_last[layer] = added_pt.curvature;
+        
+        if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > blind)
+        {
+          pl_surf.push_back(added_pt);
+        }
+        continue;
+      }
+
+      if (yaw_angle <= yaw_fp[layer])
+      {
+        added_pt.curvature = (yaw_fp[layer] - yaw_angle) / omega_l;
+      }
+      else
+      {
+        added_pt.curvature = (yaw_fp[layer] - yaw_angle + 360.0) / omega_l;
+      }
+
+      if (added_pt.curvature < time_last[layer])
+        added_pt.curvature += 360.0 / omega_l;
+
+      yaw_last[layer] = yaw_angle;
+      time_last[layer] = added_pt.curvature;
     }
-
-    if (added_pt.curvature < time_last[layer])
-      added_pt.curvature += 360.0 / omega_l;
-
-    yaw_last[layer] = yaw_angle;
-    time_last[layer] = added_pt.curvature;
 
     if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > blind)
     {

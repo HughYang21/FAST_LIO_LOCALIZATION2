@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 
 import copy
-import threading
-import time
+# import threading
+# import time
 
 import open3d as o3d
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseWithCovarianceStamped, Pose, Point, Quaternion
-from nav_msgs.msg import Odometry
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from geometry_msgs.msg import PoseWithCovarianceStamped
+# from nav_msgs.msg import Odometry
 # from rclpy.wait_for_message import wait_for_message
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Header
@@ -16,6 +18,9 @@ import numpy as np
 import tf2_ros
 import tf_transformations
 import ros2_numpy
+import logging
+
+logging.getLogger("ros2_numpy").setLevel(logging.ERROR)
 
 
 class FastLIOLocalization(Node):
@@ -44,11 +49,27 @@ class FastLIOLocalization(Node):
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+        self.pcd_header = Header()
+        self.fast_loop_cbg = MutuallyExclusiveCallbackGroup()
+        self.latest_transform = tf2_ros.TransformStamped()
+        # Broadcast a temporary identity transform so the 'map' frame exists at startup
+        self.latest_transform.header.stamp = self.get_clock().now().to_msg()
+        self.latest_transform.header.frame_id = "map"
+        self.latest_transform.child_frame_id = "odom"
+        
+        self.latest_transform.transform.translation.x = 0.0
+        self.latest_transform.transform.translation.y = 0.0
+        self.latest_transform.transform.translation.z = 0.0
+        self.latest_transform.transform.rotation.x = 0.0
+        self.latest_transform.transform.rotation.y = 0.0
+        self.latest_transform.transform.rotation.z = 0.0
+        self.latest_transform.transform.rotation.w = 1.0
 
         # self.pub_global_map = self.create_publisher(PointCloud2, self.get_parameter("pcd_map_topic").value, 10)
         self.pub_pc_in_map = self.create_publisher(PointCloud2, "/cur_scan_in_map", 10)
         self.pub_submap = self.create_publisher(PointCloud2, "/submap", 10)
-        self.pub_map_to_odom = self.create_publisher(Odometry, "/map_to_odom", 10)
+        # self.pub_map_to_odom = self.create_publisher(Odometry, "/map_to_odom", 10)
 
         self.get_logger().info("Waiting for global map...")
         # global_map_msg = wait_for_message(msg_type = PointCloud2, node = self, topic = "/cloud_pcd")[1]
@@ -57,19 +78,19 @@ class FastLIOLocalization(Node):
         self.initialize_global_map()
         self.get_logger().info("Global map received.")
         
-        self.create_subscription(PointCloud2, "/cloud_registered", self.cb_save_cur_scan, 10)
-        self.create_subscription(Odometry, "/Odometry", self.cb_save_cur_odom, 10)
-        self.create_subscription(PoseWithCovarianceStamped, "/initialpose", self.cb_initialize_pose, 10)
+        self.create_subscription(PointCloud2, "/cloud_registered", self.cb_save_cur_scan, 1, callback_group=self.fast_loop_cbg)
+        # self.create_subscription(Odometry, "/Odometry", self.cb_save_cur_odom, 10)
+        self.create_subscription(PoseWithCovarianceStamped, "/initialpose", self.cb_initialize_pose, 1)
 
         self.timer_localisation = self.create_timer(1.0 / self.get_parameter("freq_localization").value, self.localisation_timer_callback)
         # self.timer_global_map = self.create_timer(1/ self.get_parameter("freq_global_map").value, self.global_map_callback)
 
-    def global_map_callback(self):
-        # self.get_logger().info(np.array(self.global_map.points).shape)
-        header = Header()
-        header.stamp = self.get_clock().now().to_msg()
-        header.frame_id = "map"
-        self.publish_point_cloud(self.pub_global_map, header, np.array(self.global_map.points))
+    # def global_map_callback(self):
+    #     # self.get_logger().info(np.array(self.global_map.points).shape)
+    #     header = Header()
+    #     header.stamp = self.get_clock().now().to_msg()
+    #     header.frame_id = "map"
+    #     self.publish_point_cloud(self.pub_global_map, header, np.array(self.global_map.points))
         
     def pose_to_mat(self, pose):
         trans = np.eye(4)
@@ -105,8 +126,9 @@ class FastLIOLocalization(Node):
         data = dict()
         data["xyz"] = pc[:, :3]
         
-        if pc.shape[1] == 4:
-            data["intensity"] = pc[:, 3]
+        # if pc.shape[1] == 3:
+        #     data["intensity"] = np.ones((pc.shape[0], 1))
+        #     data["rgb"] = np.ones((pc.shape[0], 1))
         # else:
             # data["rgb"] = np.ones_like(pc)
         msg = ros2_numpy.msgify(PointCloud2, data)
@@ -119,7 +141,29 @@ class FastLIOLocalization(Node):
         publisher.publish(msg)
         
     def crop_global_map_in_FOV(self, pose_estimation):
-        T_odom_to_base_link = self.pose_to_mat(self.cur_odom.pose.pose)
+        try:
+            # Look up exactly what the odom -> base_link tree looked like 
+            # at the exact millisecond this point cloud frame was captured!
+            odom_to_base_stamped = self.tf_buffer.lookup_transform(
+                target_frame="odom",
+                source_frame="base_link",
+                time=self.pcd_header.stamp,
+                timeout=rclpy.duration.Duration(seconds=0.1)
+            )
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            # Fallback fallback: if tf cache didn't populate yet, broadcast with 'now' safely
+            self.get_logger().warn(f"TF2 lookup fallback active: {str(e)}")
+            return None
+
+        trans = odom_to_base_stamped.transform.translation
+        rot = odom_to_base_stamped.transform.rotation
+
+        # Assemble the T_odom_to_base_link 4x4 matrix natively
+        T_odom_to_base_link = np.eye(4)
+        T_odom_to_base_link[:3, 3] = [trans.x, trans.y, trans.z]
+        quat = [rot.x, rot.y, rot.z, rot.w]
+        T_odom_to_base_link[:3, :3] = tf_transformations.quaternion_matrix(quat)[:3, :3]
+
         T_map_to_base_link = np.matmul(pose_estimation, T_odom_to_base_link)
         T_base_link_to_map = self.inverse_se3(T_map_to_base_link)
 
@@ -141,7 +185,7 @@ class FastLIOLocalization(Node):
         global_map_in_FOV = o3d.geometry.PointCloud()
         global_map_in_FOV.points = o3d.utility.Vector3dVector(np.squeeze(global_map_in_map[indices, :3]))
 
-        header = self.cur_odom.header
+        header = odom_to_base_stamped.header
         header.frame_id = "map"
         self.publish_point_cloud(self.pub_submap, header, np.array(global_map_in_FOV.points)[::10])
 
@@ -151,15 +195,16 @@ class FastLIOLocalization(Node):
         scan_tobe_mapped = copy.copy(self.cur_scan)
         global_map_in_FOV = self.crop_global_map_in_FOV(pose_estimation)
         
-        transformation, _ = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=5)
-        
-        transformation, fitness = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=1)
-        
-        if fitness > self.get_parameter("localization_threshold").value:
-            self.T_map_to_odom = transformation
-            self.publish_odom(transformation)
-        else:
-            self.get_logger().warn(f"Fitness score {fitness} less than localization threshold {self.get_parameter('localization_threshold').value}")
+        if global_map_in_FOV is not None:
+            transformation, _ = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=5)
+            
+            transformation, fitness = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=1)
+            
+            if fitness > self.get_parameter("localization_threshold").value:
+                self.T_map_to_odom = transformation
+                self.publish_odom(transformation)
+            else:
+                self.get_logger().warn(f"Fitness score {fitness} less than localization threshold {self.get_parameter('localization_threshold').value}")
 
     def voxel_down_sample(self, pcd, voxel_size):
         # print(pcd)
@@ -173,15 +218,19 @@ class FastLIOLocalization(Node):
             
         return pcd_down
 
-    def cb_save_cur_odom(self, msg):
-        self.cur_odom = msg
+    # def cb_save_cur_odom(self, msg):
+    #     self.cur_odom = msg
         
     def cb_save_cur_scan(self, msg):
         pc = self.msg_to_array(msg)
+        self.pcd_header = msg.header
         self.cur_scan = o3d.geometry.PointCloud()
         self.cur_scan.points = o3d.utility.Vector3dVector(pc)
         self.publish_point_cloud(self.pub_pc_in_map, msg.header, pc)
-        
+        self.latest_transform.header.stamp = self.get_clock().now().to_msg()
+        self.tf_broadcaster.sendTransform(self.latest_transform)
+        # self.get_logger().info(f"Current scan received and published at time {self.get_clock().now().to_msg().sec + self.get_clock().now().to_msg().nanosec * 1e-9}.")
+
     def initialize_global_map(self): #, pc_msg):
         # self.global_map = o3d.geometry.PointCloud()
         # self.global_map.points = o3d.utility.Vector3dVector(self.msg_to_array(pc_msg)[:, :3])
@@ -199,20 +248,34 @@ class FastLIOLocalization(Node):
             self.global_localization(initial_pose)
             
     def publish_odom(self, transform):
-        odom_msg = Odometry()
-        xyz = transform[:3, 3]
+        if self.cur_scan is None:
+            return
+        scan_time = self.pcd_header.stamp
+
+        # broadcast the raw ICP result stamped at the scan_time
+        t = tf2_ros.TransformStamped()
+        t.header.stamp = scan_time  # Match the past scan history window
+        t.header.frame_id = "map"
+        t.child_frame_id = "odom"
+
+        t.transform.translation.x = transform[0, 3]
+        t.transform.translation.y = transform[1, 3]
+        t.transform.translation.z = transform[2, 3]
+
         quat = tf_transformations.quaternion_from_matrix(transform)
-        odom_msg.pose.pose = Pose(
-            position = Point(x = xyz[0], y = xyz[1], z = xyz[2]), 
-            orientation = Quaternion(x = quat[0], y = quat[1], z = quat[2], w = quat[3])
-        )
-        odom_msg.header.stamp = self.get_clock().now().to_msg()
-        odom_msg.header.frame_id = "map"
-        self.pub_map_to_odom.publish(odom_msg)
+        t.transform.rotation.x = quat[0]
+        t.transform.rotation.y = quat[1]
+        t.transform.rotation.z = quat[2]
+        t.transform.rotation.w = quat[3]
+
+        self.tf_broadcaster.sendTransform(t)
+        self.latest_transform = t  # Store the latest transform for future use
 
     def localisation_timer_callback(self):
         if not self.initialized:
-            self.get_logger().info("Waiting for initial pose...")
+            self.get_logger().info("Waiting for initial pose... Broadcasting default map->odom.")
+            self.latest_transform.header.stamp = self.get_clock().now().to_msg()           
+            self.tf_broadcaster.sendTransform(self.latest_transform)
             return
         
         if self.cur_scan is not None:
@@ -222,8 +285,16 @@ class FastLIOLocalization(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = FastLIOLocalization()
-    rclpy.spin(node)
-    rclpy.shutdown()
+    try:
+        mt_executor = MultiThreadedExecutor()
+        mt_executor.add_node(node) 
+        while rclpy.ok():
+            mt_executor.spin_once(timeout_sec=10.0)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
 
 
 if __name__ == "__main__":

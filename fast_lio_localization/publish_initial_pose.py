@@ -39,6 +39,7 @@ def main(args=None):
     args = parser.parse_args()
 
     node.publish_pose(args.x, args.y, args.z, args.roll, args.pitch, args.yaw)
+    node.destroy_node()
     rclpy.shutdown()
 
 
