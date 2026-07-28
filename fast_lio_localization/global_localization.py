@@ -9,12 +9,14 @@ import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from geometry_msgs.msg import PoseWithCovarianceStamped
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
+from geometry_msgs.msg import Pose, PoseWithCovarianceStamped
 # from nav_msgs.msg import Odometry
 # from rclpy.wait_for_message import wait_for_message
 from sensor_msgs.msg import PointCloud2
-from std_msgs.msg import Header
+from std_msgs.msg import Bool, Header
 import numpy as np
+import tf2_geometry_msgs
 import tf2_ros
 import tf_transformations
 import ros2_numpy
@@ -47,6 +49,12 @@ class FastLIOLocalization(Node):
             ],
         )
 
+        qos_profile_reliable = QoSProfile(
+        reliability=QoSReliabilityPolicy.RELIABLE,
+        history=QoSHistoryPolicy.KEEP_LAST,
+        durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        depth=1)
+
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
@@ -70,6 +78,7 @@ class FastLIOLocalization(Node):
         self.pub_pc_in_map = self.create_publisher(PointCloud2, "/cur_scan_in_map", 10)
         self.pub_submap = self.create_publisher(PointCloud2, "/submap", 10)
         # self.pub_map_to_odom = self.create_publisher(Odometry, "/map_to_odom", 10)
+        self.pub_localization_done = self.create_publisher(Bool, "/localization/initiated", qos_profile_reliable)
 
         self.get_logger().info("Waiting for global map...")
         # global_map_msg = wait_for_message(msg_type = PointCloud2, node = self, topic = "/cloud_pcd")[1]
@@ -140,13 +149,13 @@ class FastLIOLocalization(Node):
             
         publisher.publish(msg)
         
-    def crop_global_map_in_FOV(self, pose_estimation):
+    def crop_global_map_in_FOV(self, pose_estimation):  # T_map_to_odom
         try:
             # Look up exactly what the odom -> base_link tree looked like 
             # at the exact millisecond this point cloud frame was captured!
-            odom_to_base_stamped = self.tf_buffer.lookup_transform(
+            odom_to_sensor_stamped = self.tf_buffer.lookup_transform(
                 target_frame="odom",
-                source_frame="base_link",
+                source_frame="lidar",
                 time=self.pcd_header.stamp,
                 timeout=rclpy.duration.Duration(seconds=0.1)
             )
@@ -155,43 +164,43 @@ class FastLIOLocalization(Node):
             self.get_logger().warn(f"TF2 lookup fallback active: {str(e)}")
             return None
 
-        trans = odom_to_base_stamped.transform.translation
-        rot = odom_to_base_stamped.transform.rotation
+        trans = odom_to_sensor_stamped.transform.translation
+        rot = odom_to_sensor_stamped.transform.rotation
 
-        # Assemble the T_odom_to_base_link 4x4 matrix natively
-        T_odom_to_base_link = np.eye(4)
-        T_odom_to_base_link[:3, 3] = [trans.x, trans.y, trans.z]
+        # Assemble the T_odom_to_sensor 4x4 matrix natively
+        T_odom_to_sensor = np.eye(4)
+        T_odom_to_sensor[:3, 3] = [trans.x, trans.y, trans.z]
         quat = [rot.x, rot.y, rot.z, rot.w]
-        T_odom_to_base_link[:3, :3] = tf_transformations.quaternion_matrix(quat)[:3, :3]
+        T_odom_to_sensor[:3, :3] = tf_transformations.quaternion_matrix(quat)[:3, :3]
 
-        T_map_to_base_link = np.matmul(pose_estimation, T_odom_to_base_link)
-        T_base_link_to_map = self.inverse_se3(T_map_to_base_link)
+        T_map_to_sensor = np.matmul(pose_estimation, T_odom_to_sensor)
+        T_sensor_to_map = self.inverse_se3(T_map_to_sensor)
 
         global_map_in_map = np.array(self.global_map.points)
         global_map_in_map = np.column_stack([global_map_in_map, np.ones(len(global_map_in_map))])
-        global_map_in_base_link = np.matmul(T_base_link_to_map, global_map_in_map.T).T
+        global_map_in_sensor = np.matmul(T_sensor_to_map, global_map_in_map.T).T
 
         if self.get_parameter("fov").value > 3.14:
             indices = np.where(
-                (global_map_in_base_link[:, 0] < self.get_parameter("fov_far").value)
-                & (np.abs(np.arctan2(global_map_in_base_link[:, 1], global_map_in_base_link[:, 0])) < self.get_parameter("fov").value / 2.0)
+                (global_map_in_sensor[:, 0] < self.get_parameter("fov_far").value)
+                & (np.abs(np.arctan2(global_map_in_sensor[:, 1], global_map_in_sensor[:, 0])) < self.get_parameter("fov").value / 2.0)
             )
         else:
             indices = np.where(
-                (global_map_in_base_link[:, 0] > 0)
-                & (global_map_in_base_link[:, 0] < self.get_parameter("fov_far").value)
-                & (np.abs(np.arctan2(global_map_in_base_link[:, 1], global_map_in_base_link[:, 0])) < self.get_parameter("fov").value / 2.0)
+                (global_map_in_sensor[:, 0] > 0)
+                & (global_map_in_sensor[:, 0] < self.get_parameter("fov_far").value)
+                & (np.abs(np.arctan2(global_map_in_sensor[:, 1], global_map_in_sensor[:, 0])) < self.get_parameter("fov").value / 2.0)
             )
         global_map_in_FOV = o3d.geometry.PointCloud()
         global_map_in_FOV.points = o3d.utility.Vector3dVector(np.squeeze(global_map_in_map[indices, :3]))
 
-        header = odom_to_base_stamped.header
+        header = odom_to_sensor_stamped.header
         header.frame_id = "map"
         self.publish_point_cloud(self.pub_submap, header, np.array(global_map_in_FOV.points)[::10])
 
         return global_map_in_FOV
 
-    def global_localization(self, pose_estimation):
+    def global_localization(self, pose_estimation):  # T_map_to_odom
         scan_tobe_mapped = copy.copy(self.cur_scan)
         global_map_in_FOV = self.crop_global_map_in_FOV(pose_estimation)
         
@@ -239,13 +248,34 @@ class FastLIOLocalization(Node):
         # o3d.io.write_point_cloud("/home/wheelchair2/laksh_ws/pcds/lab_map_with_outside_corridor (with ground pcd)_downsampled.pcd", self.global_map)
         self.get_logger().info("Global map received.")
 
-    def cb_initialize_pose(self, msg):
-        initial_pose = self.pose_to_mat(msg.pose.pose)
+    def cb_initialize_pose(self, msg):  # pose in map frame
+        try:
+            odom_to_base_transform = self.tf_buffer.lookup_transform(
+                'base_link',
+                'odom',
+                tf2_ros.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0)
+            )
+        except Exception as e:
+            self.get_logger().warn(f'Transform failed: {e}')
+            return
+
+        T_map_to_base = self.pose_to_mat(msg.pose.pose)
         self.initialized = True
         self.get_logger().info("Initial pose received.")
+        self.pub_localization_done.publish(Bool(data=True))
+
+        odom_pos = odom_to_base_transform.transform.translation
+        odom_ori = odom_to_base_transform.transform.rotation
+        T_base_to_odom = np.eye(4)
+        T_base_to_odom[0, 3] = odom_pos.x
+        T_base_to_odom[1, 3] = odom_pos.y
+        T_base_to_odom[2, 3] = odom_pos.z
+        q_odom = [odom_ori.x, odom_ori.y, odom_ori.z, odom_ori.w]
+        T_base_to_odom[:3, :3] = tf_transformations.quaternion_matrix(q_odom)[:3, :3]
         
         if self.cur_scan is not None:
-            self.global_localization(initial_pose)
+            self.global_localization(np.matmul(T_map_to_base, T_base_to_odom))
             
     def publish_odom(self, transform):
         if self.cur_scan is None:
@@ -274,7 +304,18 @@ class FastLIOLocalization(Node):
     def localisation_timer_callback(self):
         if not self.initialized:
             self.get_logger().info("Waiting for initial pose... Broadcasting default map->odom.")
-            self.latest_transform.header.stamp = self.get_clock().now().to_msg()           
+            try:
+                self.latest_transform = self.tf_buffer.lookup_transform(
+                    'base_link',
+                    'odom',
+                    tf2_ros.Time(),
+                    timeout=rclpy.duration.Duration(seconds=1.0)
+                )
+            except Exception as e:
+                self.get_logger().warn(f'Transform failed: {e}')
+                return
+            self.latest_transform.header.frame_id = "map"
+            self.latest_transform.child_frame_id = "odom"          
             self.tf_broadcaster.sendTransform(self.latest_transform)
             return
         

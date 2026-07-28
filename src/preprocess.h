@@ -18,6 +18,13 @@ enum LID_TYPE
   OUST64,
   MID360
 };  //{1, 2, 3}
+enum TIME_UNIT
+{
+  SEC = 0,
+  MS = 1,
+  US = 2,
+  NS = 3
+};
 enum Feature
 {
   Nor,
@@ -163,7 +170,8 @@ class Preprocess
   PointCloudXYZI pl_full, pl_corn, pl_surf;
   PointCloudXYZI pl_buff[128]; //maximum 128 line lidar
   vector<orgtype> typess[128]; //maximum 128 line lidar
-  int lidar_type, point_filter_num, N_SCANS;;
+  float time_unit_scale;
+  int lidar_type, point_filter_num, N_SCANS, SCAN_RATE, time_unit;
   double blind;
   double max_scan_range;
   bool feature_enabled, given_offset_time;
