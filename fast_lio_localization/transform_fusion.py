@@ -4,6 +4,8 @@ import copy
 import threading
 import time
 import numpy as np
+if not hasattr(np, "float"):
+    np.float = float  # Fix NumPy 1.24+ removal of np.float alias for tf_transformations/transforms3d
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Pose, Point, Quaternion

@@ -16,6 +16,8 @@ from geometry_msgs.msg import Pose, PoseWithCovarianceStamped
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Bool, Header
 import numpy as np
+if not hasattr(np, "float"):
+    np.float = float  # Fix NumPy 1.24+ removal of np.float alias for tf_transformations/transforms3d
 import tf2_geometry_msgs
 import tf2_ros
 import tf_transformations
