@@ -17,6 +17,9 @@ from geometry_msgs.msg import Transform
 from std_msgs.msg import Header
 
 
+from rclpy.qos import qos_profile_sensor_data
+
+
 class TransformFusion(Node):
     def __init__(self):
         super().__init__("transform_fusion")
@@ -25,10 +28,10 @@ class TransformFusion(Node):
         self.cur_map_to_odom = None
 
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
-        self.pub_localization = self.create_publisher(Odometry, "/localization", 1)
+        self.pub_localization = self.create_publisher(Odometry, "/localization", qos_profile_sensor_data)
 
-        self.create_subscription(Odometry, "/Odometry", self.cb_save_cur_odom, 1)
-        self.create_subscription(Odometry, "/map_to_odom", self.cb_save_map_to_odom, 1)
+        self.create_subscription(Odometry, "/Odometry", self.cb_save_cur_odom, qos_profile_sensor_data)
+        self.create_subscription(Odometry, "/map_to_odom", self.cb_save_map_to_odom, qos_profile_sensor_data)
 
         self.freq_pub_localization = 50
         self.timer = self.create_timer(1/self.freq_pub_localization, self.transform_fusion)

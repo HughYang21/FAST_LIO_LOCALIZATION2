@@ -135,6 +135,8 @@ V3D euler_cur;
 V3D position_last(Zero3d);
 V3D Lidar_T_wrt_IMU(Zero3d);
 M3D Lidar_R_wrt_IMU(Eye3d);
+tf2::Transform T_odom_to_base_link_latest;
+bool odom_tf_published = false;
 
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
@@ -399,11 +401,31 @@ double lidar_mean_scantime = 0.0;
 int    scan_num = 0;
 bool sync_packages(MeasureGroup &meas)
 {
+    std::lock_guard<std::mutex> lock(mtx_buffer);
+
     if (lidar_buffer.empty() || imu_buffer.empty())
     {
-        // if (lidar_buffer.empty()) printf("lidar queue emtpy \n");
-        // if (imu_buffer.empty()) printf("imu queue emtpy \n");
         return false;
+    }
+
+    /*** Drop stale point cloud scans if there is a backlog to ensure real-time performance ***/
+    if (lidar_buffer.size() > 1)
+    {
+        int dropped_cnt = 0;
+        while (lidar_buffer.size() > 1)
+        {
+            lidar_buffer.pop_front();
+            time_buffer.pop_front();
+            dropped_cnt++;
+        }
+        // Discard IMU messages older than the new head LiDAR scan start time
+        double target_lidar_time = time_buffer.front();
+        while (!imu_buffer.empty() && get_time_sec(imu_buffer.front()->header.stamp) < target_lidar_time)
+        {
+            imu_buffer.pop_front();
+        }
+        lidar_pushed = false;
+        printf("[sync_packages]: Dropped %d stale LiDAR scan(s) to maintain real-time localization.\n", dropped_cnt);
     }
 
     /*** push a lidar scan ***/
@@ -413,6 +435,7 @@ bool sync_packages(MeasureGroup &meas)
         if (meas.lidar->points.size() <= 1)
         {
             lidar_buffer.pop_front();
+            time_buffer.pop_front();
             return false;
         }
         meas.lidar_beg_time = time_buffer.front();
@@ -422,7 +445,6 @@ bool sync_packages(MeasureGroup &meas)
 
     if (last_timestamp_imu < lidar_end_time)
     {
-        // printf("--last imu time stamp = %0.3f \n", last_timestamp_imu);
         return false;
     }
 
@@ -541,8 +563,10 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     publish_count -= PUBFRAME_PERIOD;
 }
 
-void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect, std::unique_ptr<tf2_ros::Buffer> &tf_buffer_)
+void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect)
 {
+    if (!odom_tf_published) return;
+
     PointCloudXYZI::Ptr laserCloudWorld(
         new PointCloudXYZI(effct_feat_num, 1));
     for (int i = 0; i < effct_feat_num; i++)
@@ -551,18 +575,7 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
                             &laserCloudWorld->points[i]);
     }
     
-    tf2::Transform T_odom_to_body;
-    try {
-        geometry_msgs::msg::TransformStamped static_tf = tf_buffer_->lookupTransform(
-            "odom", "base_link", rclcpp::Time(0), rclcpp::Duration::from_seconds(1.0));
-        tf2::fromMsg(static_tf.transform, T_odom_to_body);
-    }
-    catch (tf2::TransformException &ex) {
-        RCLCPP_WARN(rclcpp::get_logger("laserMapping"), "Could not get static transform from 'odom' to 'base_link': %s", ex.what());
-        return;
-    }
-
-    tf2::Transform T_body_to_odom = T_odom_to_body.inverse();
+    tf2::Transform T_body_to_odom = T_odom_to_base_link_latest.inverse();
     Eigen::Vector3d translation(
         T_body_to_odom.getOrigin().x(),
         T_body_to_odom.getOrigin().y(),
@@ -619,6 +632,16 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.child_frame_id = "base_link";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
+
+    // Transform world linear velocity state_point.vel into robot body frame base_link
+    Eigen::Vector3d vel_world = state_point.vel;
+    Eigen::Matrix3d R_world_to_lidar = state_point.rot.toRotationMatrix(); // SO3 to Eigen::Matrix3d
+    Eigen::Vector3d vel_body = R_world_to_lidar.transpose() * vel_world; // World to body velocity
+
+    odomAftMapped.twist.twist.linear.x = vel_body(0);
+    odomAftMapped.twist.twist.linear.y = vel_body(1);
+    odomAftMapped.twist.twist.linear.z = vel_body(2);
+
     pubOdomAftMapped->publish(odomAftMapped);
     auto P = kf.get_P();
     for (int i = 0; i < 6; i++)
@@ -657,6 +680,9 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
 
     // Broadcast out to the system tree natively
     tf_br->sendTransform(tf_msg);
+
+    T_odom_to_base_link_latest = T_odom_to_base_link;
+    odom_tf_published = true;
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
@@ -931,23 +957,28 @@ public:
         auto imu_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         auto imu_sub_options = rclcpp::SubscriptionOptions();
         imu_sub_options.callback_group = imu_callback_group_;
+
+        auto pcl_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        auto pcl_sub_options = rclcpp::SubscriptionOptions();
+        pcl_sub_options.callback_group = pcl_callback_group_;
+
         auto imu_qos = rclcpp::SensorDataQoS().keep_last(10);
         auto lidar_qos = rclcpp::SensorDataQoS();  // default depth = 5
 
         if (p_pre->lidar_type == AVIA)
         {
-            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, lidar_qos, livox_pcl_cbk);
+            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, lidar_qos, livox_pcl_cbk, pcl_sub_options);
         }
         else
         {
-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, lidar_qos, standard_pcl_cbk);
+            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, lidar_qos, standard_pcl_cbk, pcl_sub_options);
         }
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, imu_qos, imu_cbk, imu_sub_options);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
-        pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
+        pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", rclcpp::SensorDataQoS());
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
         tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
@@ -1096,7 +1127,7 @@ private:
                 try {
                     // Look up the static transform from lidar to base_link
                     geometry_msgs::msg::TransformStamped static_tf = tf_buffer_->lookupTransform(
-                        "lidar", "base_link", rclcpp::Time(0), rclcpp::Duration::from_seconds(0.5));
+                        "lidar", "base_link", rclcpp::Time(0), rclcpp::Duration::from_seconds(0.05));
                     
                     // Convert it to a native tf2 Transform object
                     tf2::fromMsg(static_tf.transform, T_lidar_to_base_link_);
@@ -1125,7 +1156,7 @@ private:
             if (scan_pub_en && scan_body_pub_en)
                 publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en)
-                publish_effect_world(pubLaserCloudEffect_, tf_buffer_);
+                publish_effect_world(pubLaserCloudEffect_);
 
             /*** Debug variables ***/
             if (runtime_pos_log)
@@ -1152,7 +1183,7 @@ private:
                 time_log_counter++;
                 // printf("[ mapping ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: %0.6f  ave ICP: %0.6f  map incre: %0.6f ave total: %0.6f icp: %0.6f construct H: %0.6f \n", t1 - t0, aver_time_match, aver_time_solve, t3 - t1, t5 - t3, aver_time_consu, aver_time_icp, aver_time_const_H_time);
                 double te = omp_get_wtime();
-                printf("[ mapping ]: time: ave total: %0.6f from %0.6f with %0.6f\n", aver_time_consu, te, te - ts);
+                // printf("[ mapping ]: time: ave total: %0.6f from %0.6f with %0.6f\n", aver_time_consu, te, te - ts);
                 ext_euler = SO3ToEuler(state_point.offset_R_L_I);
                 fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " " << state_point.pos.transpose() << " " << ext_euler.transpose() << " " << state_point.offset_T_L_I.transpose() << " " << state_point.vel.transpose()
                          << " " << state_point.bg.transpose() << " " << state_point.ba.transpose() << " " << state_point.grav << " " << feats_undistort->points.size() << endl;

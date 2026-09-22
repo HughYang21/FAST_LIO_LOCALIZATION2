@@ -3,14 +3,10 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2, Imu
 from livox_ros_driver2.msg import CustomMsg
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import qos_profile_sensor_data
 import numpy as np
 
-qos_profile = QoSProfile(
-    reliability=ReliabilityPolicy.RELIABLE,  # Ensure reliable message delivery
-    history=HistoryPolicy.KEEP_LAST,        # Keep the last few messages
-    depth=10                                # Increase buffer size
-)
+qos_profile = qos_profile_sensor_data
 
 class LivoxLaserToPointcloud(Node):
     LIVOX_DTYPE = np.dtype([
